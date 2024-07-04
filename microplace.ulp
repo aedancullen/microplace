@@ -1,0 +1,536 @@
+// Airwire-length-driven greedy placer for digital microelectronics layout
+// Copyright (c) 2022-2023 Aedan Cullen <aedan@aedancullen.com>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+int angles[] = {0, 90, 180, 270};
+
+int gridSize;
+int halfGrid;
+
+int boardMinX = 0;
+int boardMinY = 0;
+int boardMaxX = 0;
+int boardMaxY = 0;
+
+int nPlaced = 0;
+int nUnplaced = 0;
+
+UL_ELEMENT unplaced[];
+
+real unplacedPrioArea[];
+real unplacedPrioPincount[];
+int sortIndex[];
+
+int nEdges = 0;
+
+int contactsSelfX[];
+int contactsSelfY[];
+int contactsOtherX[];
+int contactsOtherY[];
+
+string apEName[];
+int apEA[]; // Angle
+int apEM[]; // Mirror
+int apEX[];
+int apEY[];
+int apEMinX[];
+int apEMinY[];
+int apEMaxX[];
+int apEMaxY[];
+int apEPincount[];
+
+string str = "";
+string exitResult = "";
+
+// Compute the AABB of e as it appears (incl. rotation)
+// and store into idx of apEMinX/apEMinY/apEMaxX/apEMaxY *without* adding x/y center pos.
+// x/y center pos for unplaced components that are then placed must be added later.
+void recordAABB(int idx, UL_ELEMENT e) {
+    int eMinX = INT_MIN;
+    int eMinY = INT_MIN;
+    int eMaxX = INT_MAX;
+    int eMaxY = INT_MAX;
+    // Choose horizontal/vertical lines that span the component origin,
+    // and use them to find the smallest bounding box drawn around the component.
+    // This is done to reject larger duplicate keepout-style boxes found in some footprints.
+    e.footprint.wires(w) {
+        if (w.layer == 51 || w.layer == 52) { // tDocu/bDocu
+            int wx1 = w.x1 - e.x;
+            int wx2 = w.x2 - e.x;
+            int wy1 = w.y1 - e.y;
+            int wy2 = w.y2 - e.y;
+            if (
+                (
+                    (wx1 == wx2 && abs(wy2 - wy1) > 0.5) || (wy1 == wy2 && abs(wx2 - wx1) > 0.5)
+                ) &&
+                (
+                    ((wx1 > 0 && wx2 < 0) || (wx1 < 0 && wx2 > 0)) ||
+                    ((wy1 > 0 && wy2 < 0) || (wy1 < 0 && wy2 > 0))
+                )
+            ) {
+                if (wx1 > 0) {
+                    eMaxX = min(eMaxX, wx1);
+                }
+                else {
+                    eMinX = max(eMinX, wx1);
+                }
+                if (wx2 > 0) {
+                    eMaxX = min(eMaxX, wx2);
+                }
+                else {
+                    eMinX = max(eMinX, wx2);
+                }
+                if (wy1 > 0) {
+                    eMaxY = min(eMaxY, wy1);
+                }
+                else {
+                    eMinY = max(eMinY, wy1);
+                }
+                if (wy2 > 0) {
+                    eMaxY = min(eMaxY, wy2);
+                }
+                else {
+                    eMinY = max(eMinY, wy2);
+                }
+            }
+        }
+    }
+    // Only expand AABB if no outline was drawn to contract to.
+    if (eMinX == INT_MIN) {
+        eMinX = 0;
+        eMinY = 0;
+        eMaxX = 0;
+        eMaxY = 0;
+    }
+    apEPincount[idx] = 0;
+    // Expand the bounding box to include the entirety of all pads.
+    // Also record the total pin count for priority sorting later.
+    e.footprint.contacts(c) {
+        apEPincount[idx] += 1;
+        if (c.smd) {
+            int cSmdX = c.smd.x - e.x;
+            int cSmdY = c.smd.y - e.y;
+            int radiusX = c.smd.dx[c.smd.layer] / 2;
+            int radiusY = c.smd.dy[c.smd.layer] / 2;
+            if (c.smd.angle == 90 || c.smd.angle == 270) {
+                int tmp = radiusX;
+                radiusX = radiusY;
+                radiusY = tmp;
+            }
+            eMinX = min(eMinX, cSmdX - radiusX);
+            eMinY = min(eMinY, cSmdY - radiusY);
+            eMaxX = max(eMaxX, cSmdX + radiusX);
+            eMaxY = max(eMaxY, cSmdY + radiusY);
+        }
+    }
+    eMinX -= halfGrid;
+    eMinY -= halfGrid;
+    eMaxX += halfGrid;
+    eMaxY += halfGrid;
+    apEMinX[idx] = eMinX;
+    apEMinY[idx] = eMinY;
+    apEMaxX[idx] = eMaxX;
+    apEMaxY[idx] = eMaxY;
+}
+
+// Check the candidate AABB (with x/y center pos added and mirror considered) for collisions.
+// iMax is the first unplaced-component index *not* to consider (all below have autoplaced already).
+// All already-placed components are always consideredd in the first loop.
+int isValid(int iMax, int candEMinX, int candEMinY, int candEMaxX, int candEMaxY, int candEM) {
+    if (
+        candEMinX < boardMinX + halfGrid ||
+        candEMinY < boardMinY + halfGrid ||
+        candEMaxX > boardMaxX - halfGrid ||
+        candEMaxY > boardMaxY - halfGrid
+    ) {
+        return 0;
+    }
+    for (int i = 0; i < nPlaced; i++) {
+        if (candEM == apEM[i]) {
+            if (
+                (candEMinX < apEMaxX[i] && candEMaxX > apEMinX[i]) &&
+                (candEMinY < apEMaxY[i] && candEMaxY > apEMinY[i])
+            ) {
+                return 0;
+            }
+        }
+    }
+    for (i = 0; i < iMax; i++) {
+        int upIdx = sortIndex[i];
+        if (candEM == apEM[nPlaced + upIdx]) {
+            if (
+                (candEMinX < apEMaxX[nPlaced + upIdx] && candEMaxX > apEMinX[nPlaced + upIdx]) &&
+                (candEMinY < apEMaxY[nPlaced + upIdx] && candEMaxY > apEMinY[nPlaced + upIdx])
+            ) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+// Using the globals contacts{Self,Other}{X,Y}, find the sum of contact-contact L2 norms.
+// nEdges is the total number of such contact-contact relationships to consider.
+real computeCost() {
+    real sumDist = 0;
+    for (int i = 0; i < nEdges; i++) {
+        sumDist += pow(contactsSelfX[i] - contactsOtherX[i], 2) + pow(contactsSelfY[i] - contactsOtherY[i], 2);
+    }
+    return sumDist;
+}
+
+output("microplace.txt", "wt") {
+    board(b) {
+        // Set gridSize, set halfGrid, and find board boundaries.
+        if (b.grid.unitdist == GRID_UNIT_MIC) {
+            gridSize = mic2u(b.grid.distance);
+        }
+        else if (b.grid.unitdist == GRID_UNIT_MM) {
+            gridSize = mm2u(b.grid.distance);
+        }
+        else if (b.grid.unitdist == GRID_UNIT_MIL) {
+            gridSize = mil2u(b.grid.distance);
+        }
+        else if (b.grid.unitdist == GRID_UNIT_INCH) {
+            gridSize = inch2u(b.grid.distance);
+        }
+        halfGrid = gridSize / 2;
+        b.wires(w) {
+            if (w.layer == 20) { // Dimension
+                boardMinX = min(boardMinX, w.x1);
+                boardMinX = min(boardMinX, w.x2);
+
+                boardMinY = min(boardMinY, w.y1);
+                boardMinY = min(boardMinY, w.y2);
+
+                boardMaxX = max(boardMaxX, w.x1);
+                boardMaxX = max(boardMaxX, w.x2);
+
+                boardMaxY = max(boardMaxY, w.y1);
+                boardMaxY = max(boardMaxY, w.y2);
+            }
+        }
+        // Use all Patch_Top/Patch_Bot rectangles of angle 0 as keepout tools.
+        // EM/EMinX/EMinY/EMaxX/EMaxY are the values checked by isValid(),
+        // so we use this mechanism to pretend that this is an already-placed component.
+        b.rectangles(r) {
+            if (r.angle == 0) {
+                if (r.layer == 101) { // Patch_Top
+                    apEM[nPlaced] = 0;
+                    apEMinX[nPlaced] = r.x1 - halfGrid;
+                    apEMinY[nPlaced] = r.y1 - halfGrid;
+                    apEMaxX[nPlaced] = r.x2 + halfGrid;
+                    apEMaxY[nPlaced] = r.y2 + halfGrid;
+                    nPlaced += 1;
+                }
+                else if (r.layer == 116) { // Patch_Bot
+                    apEM[nPlaced] = 1;
+                    apEMinX[nPlaced] = r.x1 - halfGrid;
+                    apEMinY[nPlaced] = r.y1 - halfGrid;
+                    apEMaxX[nPlaced] = r.x2 + halfGrid;
+                    apEMaxY[nPlaced] = r.y2 + halfGrid;
+                    nPlaced += 1;
+                }
+            }
+        }
+        // For each component, decide whether it is in the board or not and classify it as placed or unplaced.
+        // Fill out global record-keeping parameters for placed components, noting the addition of x/y center pos to the AABB.
+        b.elements(e) {
+            if (
+                e.x > boardMinX &&
+                e.x < boardMaxX &&
+                e.y > boardMinY &&
+                e.y < boardMaxY
+            ) {
+                recordAABB(nPlaced, e);
+                apEName[nPlaced] = e.name;
+                apEA[nPlaced] = e.angle;
+                apEM[nPlaced] = e.mirror;
+                apEX[nPlaced] = e.x;
+                apEY[nPlaced] = e.y;
+                apEMinX[nPlaced] += e.x;
+                apEMinY[nPlaced] += e.y;
+                apEMaxX[nPlaced] += e.x;
+                apEMaxY[nPlaced] += e.y;
+                nPlaced += 1;
+            }
+            else {
+                if (e.populate == 1) {
+                    unplaced[nUnplaced] = e;
+                    nUnplaced += 1;
+                }
+            }
+        }
+        // Compute AABBs for unplaced components, storing into record-keeping indices after the list of already-placed components.
+        // Compute priority metrics based on area and pincount for use in sorting unplaced components by placement priority.
+        for (int i = 0; i < nUnplaced; i++) {
+            UL_ELEMENT e = unplaced[i];
+            recordAABB(nPlaced + i, e);
+            unplacedPrioArea[i] = -(
+                real(apEMaxX[nPlaced + i] - apEMinX[nPlaced + i]) *
+                real(apEMaxY[nPlaced + i] - apEMinY[nPlaced + i])
+            );
+            unplacedPrioPincount[i] = -real(apEPincount[nPlaced + i]);
+        }
+        // Write indices into sortIndex that define a sorted order by unplacedPrioPincount, then by unplacedPrioArea.
+        sort(nUnplaced, sortIndex, unplacedPrioPincount, unplacedPrioArea);
+        // Main placement loop
+        for (i = 0; i < nUnplaced; i++) {
+            int upIdx = sortIndex[i]; // Lookup element in the sort (i is monotonic, sortIndex defines sort order)
+            UL_ELEMENT e = unplaced[upIdx];
+            int baseEMinX;
+            int baseEMinY;
+            int baseEMaxX;
+            int baseEMaxY;
+            int candEMinX;
+            int candEMinY;
+            int candEMaxX;
+            int candEMaxY;
+            int preContactsSelfX[];
+            int preContactsSelfY[];
+            int baseContactsSelfX[];
+            int baseContactsSelfY[];
+            real bestCost = REAL_MAX;
+            int bestA;
+            int bestM;
+            int bestX;
+            int bestY;
+            int bestEMinX;
+            int bestEMinY;
+            int bestEMaxX;
+            int bestEMaxY;
+            nEdges = 0; // Reset global edge counter
+            // Set preContactsSelf{X,Y} and contactsOther{X,Y}.
+            // preContactsSelf{X,Y} does not include rotation OR x/y center pos.
+            // baseContactsSelf{X,Y} will then have rotation added, and finally
+            // the globals contactsSelf{X,Y} will have x/y center pos added as they are updated in the search loops.
+            b.signals(s) { if (s.name != "GND") {
+                // Determine whether this signal has a contact on this component (e).
+                // If so, store its *first* contact on this component in matchedRef.
+                // This single contact will be considered the origin of this signal on this component,
+                // used as one endpoint of all outgoing edges to other components.
+                int matched = 0;
+                UL_CONTACTREF matchedRef;
+                s.contactrefs(c) {
+                    if (c.element.name == e.name) {
+                        matched = 1;
+                        matchedRef = c;
+                        break;
+                    }
+                }
+                // If this signal does have a contact on this component,
+                if (matched == 1) {
+                    // Go through all the signal's contacts
+                    s.contactrefs(c) {
+                        // and for each which is *not* on this component,
+                        if (c.element.name != e.name) {
+                            // determine whether this component was placed.
+                            // First check already-placed components
+                            int placed = 0;
+                            int placedIdx;
+                            int upIdx2 = -1;
+                            for (int j = 0; j < nPlaced; j++) {
+                                if (c.element.name == apEName[j]) {
+                                    placed = 1;
+                                    placedIdx = j;
+                                    break;
+                                }
+                            }
+                            // and if nothing, check unplaced components (that we placed up to i, recording info in apE... globals).
+                            if (placed == 0) {
+                                for (int j = 0; j < i; j++) {
+                                    upIdx2 = sortIndex[j]; // Lookup element in the sort (i is monotonic, sortIndex defines sort order)
+                                    if (c.element.name == apEName[nPlaced + upIdx2]) {
+                                        placed = 1;
+                                        placedIdx = nPlaced + upIdx2;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (placed == 1) {
+                                // placedIdx now contains the index in apE... globals of the placed component corresponding to this contact.
+                                // matchedRef is the single origin contact of this signal on the component we are currently placing.
+                                preContactsSelfX[nEdges] = matchedRef.contact.x - matchedRef.element.x;
+                                preContactsSelfY[nEdges] = matchedRef.contact.y - matchedRef.element.y;
+                                // Set contactsOther{X,Y} to include everything (rotation and x/y center pos) for other-component (c) contact.
+                                // Force no tranform if it was an already-placed component; in that case c.contact.x/y are already rotated.
+                                if (upIdx2 == -1 || apEA[placedIdx] == 0) {
+                                    contactsOtherX[nEdges] = (c.contact.x - c.element.x);
+                                    contactsOtherY[nEdges] = (c.contact.y - c.element.y);
+                                }
+                                else if (apEA[placedIdx] == 90) {
+                                    contactsOtherX[nEdges] = -(c.contact.y - c.element.y);
+                                    contactsOtherY[nEdges] = (c.contact.x - c.element.x);
+                                }
+                                else if (apEA[placedIdx] == 180) {
+                                    contactsOtherX[nEdges] = -(c.contact.x - c.element.x);
+                                    contactsOtherY[nEdges] = -(c.contact.y - c.element.y);
+                                }
+                                else if (apEA[placedIdx] == 270) {
+                                    contactsOtherX[nEdges] = (c.contact.y - c.element.y);
+                                    contactsOtherY[nEdges] = -(c.contact.x - c.element.x);
+                                }
+                                // Only allow transform if it was not an already-placed component.
+                                if (upIdx2 != -1 && apEM[placedIdx] == 1) {
+                                    contactsOtherX[nEdges] = -contactsOtherX[nEdges];
+                                }
+                                contactsOtherX[nEdges] += apEX[placedIdx];
+                                contactsOtherY[nEdges] += apEY[placedIdx];
+                                // Increment global edge counter
+                                nEdges += 1;
+                            }
+                        }
+                    }
+                }
+            }}
+            // Placement search level 1: angle
+            for (int aIdx = 0; aIdx < 4; aIdx++) {
+                int a = angles[aIdx]; // Angle lookup
+                // Transform component AABB according to angle
+                if (a == 0) {
+                    baseEMinX = apEMinX[nPlaced + upIdx];
+                    baseEMinY = apEMinY[nPlaced + upIdx];
+                    baseEMaxX = apEMaxX[nPlaced + upIdx];
+                    baseEMaxY = apEMaxY[nPlaced + upIdx];
+                }
+                else if (a == 90) {
+                    baseEMinX = -apEMaxY[nPlaced + upIdx];
+                    baseEMinY = apEMinX[nPlaced + upIdx];
+                    baseEMaxX = -apEMinY[nPlaced + upIdx];
+                    baseEMaxY = apEMaxX[nPlaced + upIdx];
+                }
+                else if (a == 180) {
+                    baseEMinX = -apEMaxX[nPlaced + upIdx];
+                    baseEMinY = -apEMaxY[nPlaced + upIdx];
+                    baseEMaxX = -apEMinX[nPlaced + upIdx];
+                    baseEMaxY = -apEMinY[nPlaced + upIdx];
+                }
+                else if (a == 270) {
+                    baseEMinX = apEMinY[nPlaced + upIdx];
+                    baseEMinY = -apEMaxX[nPlaced + upIdx];
+                    baseEMaxX = apEMaxY[nPlaced + upIdx];
+                    baseEMaxY = -apEMinX[nPlaced + upIdx];
+                }
+                // Transform component contacts according to angle
+                for (int j = 0; j < nEdges; j++) {
+                    if (a == 0) {
+                        baseContactsSelfX[j] = preContactsSelfX[j];
+                        baseContactsSelfY[j] = preContactsSelfY[j];
+                    }
+                    else if (a == 90) {
+                        baseContactsSelfX[j] = -preContactsSelfY[j];
+                        baseContactsSelfY[j] = preContactsSelfX[j];
+                    }
+                    else if (a == 180) {
+                        baseContactsSelfX[j] = -preContactsSelfX[j];
+                        baseContactsSelfY[j] = -preContactsSelfY[j];
+                    }
+                    else if (a == 270) {
+                        baseContactsSelfX[j] = preContactsSelfY[j];
+                        baseContactsSelfY[j] = -preContactsSelfX[j];
+                    }
+                }
+                // Placement search level 2: mirror
+                for (int m = 0; m <= 1; m++) {
+                    // Transform component AABB according to mirror
+                    if (m == 1) {
+                        int tmp = baseEMinX;
+                        baseEMinX = -baseEMaxX;
+                        baseEMaxX = -tmp;
+                    }
+                    // Transform component contacts according to mirror
+                    if (m == 1) {
+                        for (int j = 0; j < nEdges; j++) {
+                            baseContactsSelfX[j] = -baseContactsSelfX[j];
+                        }
+                    }
+                    // Placement search level 3: X
+                    for (real x = boardMinX; x < boardMaxX; x += gridSize) {
+                        // Transform component AABB according to mirror
+                        candEMinX = baseEMinX + x;
+                        candEMaxX = baseEMaxX + x;
+                        // Transform component contacts according to mirror
+                        for (int j = 0; j < nEdges; j++) {
+                            contactsSelfX[j] = baseContactsSelfX[j] + x;
+                        }
+                        // Placement search level 4: Y
+                        for (real y = boardMinY; y < boardMaxY; y += gridSize) {
+                            // Transform component AABB according to mirror
+                            candEMinY = baseEMinY + y;
+                            candEMaxY = baseEMaxY + y;
+                            // We don't need to transform contacts until we make sure the AABB is not in collision...
+                            if (isValid(i, candEMinX, candEMinY, candEMaxX, candEMaxY, m) == 1) {
+                                // ...and then we transform component contacts to check cost.
+                                for (int j = 0; j < nEdges; j++) {
+                                    contactsSelfY[j] = baseContactsSelfY[j] + y;
+                                }
+                                real cost = computeCost();
+                                // Update best records of all record-keeping quantities if cost is better.
+                                if (cost < bestCost) {
+                                    bestCost = cost;
+                                    bestA = a;
+                                    bestM = m;
+                                    bestX = x;
+                                    bestY = y;
+                                    bestEMinX = candEMinX;
+                                    bestEMinY = candEMinY;
+                                    bestEMaxX = candEMaxX;
+                                    bestEMaxY = candEMaxY;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // If placement succeeded, write final value of record-keeping quantities for this component into globals.
+            if (bestCost != REAL_MAX) {
+                apEName[nPlaced + upIdx] = e.name;
+                apEA[nPlaced + upIdx] = bestA;
+                apEM[nPlaced + upIdx] = bestM;
+                apEX[nPlaced + upIdx] = bestX;
+                apEY[nPlaced + upIdx] = bestY;
+                apEMinX[nPlaced + upIdx] = bestEMinX;
+                apEMinY[nPlaced + upIdx] = bestEMinY;
+                apEMaxX[nPlaced + upIdx] = bestEMaxX;
+                apEMaxY[nPlaced + upIdx] = bestEMaxY;
+                // Convert back to real grid units and generate placement commands.
+                real gridUnitX;
+                real gridUnitY;
+                if (b.grid.unitdist == GRID_UNIT_MIC) {
+                    gridUnitX = u2mic(bestX);
+                    gridUnitY = u2mic(bestY);
+                }
+                else if (b.grid.unitdist == GRID_UNIT_MM) {
+                    gridUnitX = u2mm(bestX);
+                    gridUnitY = u2mm(bestY);
+                }
+                else if (b.grid.unitdist == GRID_UNIT_MIL) {
+                    gridUnitX = u2mil(bestX);
+                    gridUnitY = u2mil(bestY);
+                }
+                else if (b.grid.unitdist == GRID_UNIT_INCH) {
+                    gridUnitX = u2inch(bestX);
+                    gridUnitY = u2inch(bestY);
+                }
+                if (bestM == 1) {
+                    sprintf(str, "ROTATE =MR%d '%s';\n", bestA, e.name);
+                }
+                else {
+                    sprintf(str, "ROTATE =R%d '%s';\n", bestA, e.name);
+                }
+                exitResult += str;
+                sprintf(str, "MOVE '%s' (%f %f);\n", e.name, gridUnitX, gridUnitY);
+                exitResult += str;
+                printf("Placed %s at %ddeg, %f, %f, mirror=%d\n", e.name, bestA, u2mm(bestX), u2mm(bestY), bestM);
+            }
+            else {
+                sprintf(str, ":Failed to place %s (%d/%d)", e.name, i + 1, nUnplaced);
+                printf(str);
+                dlgMessageBox(str);
+                exit(1);
+            }
+        }
+        printf(exitResult);
+        exit(exitResult);
+    }
+}
